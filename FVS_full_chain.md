@@ -108,3 +108,121 @@ FUN_180026b84	Builds STARTUPINFOEX for CreateProcessAsUserW. Vulnerable: adds ra
 FUN_180015600	Copies 0xF8 bytes from the mapped section into a local buffer. No validation of contents beyond the initial TargetPid check.
 Remaining Unknowns
 The only missing piece for a fully weaponized exploit is the exact ALPC port name used by WerSvc. The port is created during service initialization and is expected to be in the \RPC Control or \BaseNamedObjects namespace. The enumeration script provided earlier is designed to extract this name from a live system. Once the port name is confirmed, the exploit chain is complete.
+
+
+
+
+0415 09222026
+Target
+Windows Error Reporting Service (WerSvc) — wersvc.dll version 10.0.26100.9278. No WER-specific security patches installed (KB5045934 or similar absent). Vulnerability likely present.
+
+ALPC Port Identification
+The service exposes an ALPC port named \WindowsErrorReportingServicePort. Confirmed via object namespace enumeration and successful connection.
+
+Connection Methodology
+Initial attempts to connect using NtAlpcConnectPort failed universally with STATUS_INVALID_PARAMETER (0xC000000D). Root cause: incorrect function prototype. The 6th parameter is RequiredServerSid (PSID), not SectionHandle (PVOID). Passing NULL for RequiredServerSid means no SID restriction.
+
+Working call signature:
+
+c
+NtAlpcConnectPort(
+    &hPort,
+    &portName,
+    NULL,       // ObjectAttributes — NULL works
+    NULL,       // PortAttributes — NULL works
+    0,          // Flags
+    NULL,       // RequiredServerSid — NULL = no restriction
+    connMsg,    // ConnectionMessage — must be valid PORT_MESSAGE
+    &connLen,   // BufferLength
+    NULL,       // OutMessageAttributes
+    NULL,       // InMessageAttributes
+    NULL);      // Timeout
+Connection message must have TotalLength = 0x28 and DataLength = 0. Zeroed buffer otherwise. Returns STATUS_SUCCESS with connLen = 40.
+
+NtConnectPort (legacy LPC) also fails with 0xC000000D. The modern ALPC API is required.
+
+Port Creation Timing
+WerSvc creates the ALPC port lazily. Starting the service via SCM does NOT create the port. The port only appears after triggering an actual WER report. Reliable trigger sequence:
+
+Start WerSvc via StartService
+Launch rundll32.exe sysdm.cpl,NoEntry (sacrificial crash)
+Call WerReportCreate + WerReportSubmit via wer.dll
+After this sequence, NtAlpcConnectPort succeeds.
+
+Message Format
+Post-connect sends via NtAlpcSendWaitReceivePort fail with STATUS_PORT_DISCONNECTED (0xC0000037) after the first message. The port is one-shot — the connection message IS the payload.
+
+Working message size: 0x200 bytes total (0x28 PORT_MESSAGE header + 0x1D8 body). Sizes 0x578, 0x400, 0x300 fail with STATUS_INVALID_BUFFER_SIZE (0xC000002F). Sizes 0x200 and below succeed.
+
+WER Message Body Layout
+Reverse-engineered from server reply echoes:
+
+Offset	Size	Field
+0x28	4	Method
+0x2C	4	Flags
+0x30	4	PidPrimary
+0x34	4	Pad1
+0x38	4	Tid
+0x3C	0x24	Pad2
+0x60	4	PidSecondary
+0x64	4	HandleValue
+0x68	40	HandleArray[5]
+0x90	4	StatusOut (reply)
+0x94	4	ResultOut (reply)
+0x98	0x4B8	SharedData
+Server Reply Analysis
+With Method = 0x00: StatusOut = 0x00000000, ResultOut = 0x00000000. Server echoes PIDs and handle value at offsets 0x30, 0x60, 0x64. No action taken.
+
+With Method = 0x01: StatusOut = 0x00000001, ResultOut = 0x00000000. Server processed differently — resolved PIDs and attempted something. Offset 0x30 shows PidPrimary and a different PID (possibly resolved from handle). No WerFault.exe spawned.
+
+Reply at offset 0x30 contains two PIDs: our PidPrimary and a second PID that appears to be resolved from the handle value. This suggests the server is doing handle-to-PID translation.
+
+Handle Grooming
+Process A creates a file mapping and records the handle value. Process B must create a file mapping at the exact same handle value. This requires filling the handle table with cheap objects (events) until the target index is reached.
+
+Current algorithm: allocate events one at a time, compare handle value to target. On exact match, close and create payload. On overshoot, close and retry.
+
+Success rate: approximately 50%. Handle table has gaps from prior allocations. When overshoot occurs repeatedly, the algorithm gives up after 50 attempts. Need deterministic approach — possibly close all events first, then allocate exactly the right count.
+
+Shared Section Content
+Process A's file mapping (handle 0xEC or similar) must contain a properly formatted structure. Currently writing:
+
+Offset 0x00: Size = 0xF8
+Offset 0x04: TargetPid = pidB
+Offset 0x08: Filled with 0x41 pattern
+Offsets 0x08, 0x48, 0x88: Fake command lines (cmd.exe /c calc.exe)
+The itm4n CVE writeup indicates the command line for WerFault.exe is constructed from this shared section. Exact offset of the command line field unknown — need to reverse-engineer wersvc.dll or capture a real WER message.
+
+Vulnerability Mechanism (Hypothesis)
+Based on itm4n's CVE writeup:
+
+WerSvc receives ALPC message with PidPrimary, PidSecondary, and HandleValue
+It validates the handle against PidPrimary's handle table
+It duplicates the handle from PidSecondary's handle table using the same value
+It reads the shared section content via the duplicated handle
+It calls CreateProcessAsUserW with PidPrimary as parent and command line from shared section
+The confusion: validation against Process A, duplication from Process B. If both processes have the same handle value but pointing to different objects, WerSvc reads Process B's object while trusting Process A's identity.
+
+Outstanding Questions
+What Method value triggers the WerpProcessReport path that calls CreateProcessAsUserW?
+What is the exact layout of the shared section? Where is the command line field?
+Does the handle confusion actually work, or does WerSvc validate ownership after duplication?
+Why does Method = 0x01 return StatusOut = 0x1 instead of 0x0? What does that status mean?
+Next Steps
+Fix handle grooming to be deterministic — close all events first, then allocate exact count
+Test Method values 0x02 through 0x05 with correct handle alignment
+Reverse-engineer wersvc.dll to find the WerpProcessReport function and shared section parsing
+Capture a real WER ALPC message between a crashing process and WerSvc to compare format
+Try different Flags values in the message body
+Tools and Techniques
+NtAlpcConnectPort with RequiredServerSid = NULL for connection
+Connection message carries payload — no post-connect sends
+Message size 0x200 bytes
+Handle grooming via CreateEventW to fill handle table
+CreateFileMappingW for payload objects at target handle index
+Shared memory section (Global\WER_Exploit_IPC) for inter-process communication
+CreateToolhelp32Snapshot to detect WerFault.exe spawns
+References
+itm4n CVE writeup — confirms CreateProcessAsUserW path and handle confusion mechanism
+ntdoc.m417z.com — correct NtAlpcConnectPort signature with RequiredServerSid
+y3a ALPC analysis — confirms WerSvc uses NtAlpcConnectPort with connection message payload
